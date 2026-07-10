@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+screenshots/
+gesture_data/
+gesture_models/
+.env
+venv/
+.vscode/
+*.task
