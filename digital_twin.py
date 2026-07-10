@@ -1,184 +1,389 @@
 """
-Digital Twin — 3D 数字孪生场景 (深度校准版)
+Digital Twin v4 — 高精度手部建模 + 完善3D场景
 
-使用 DepthCalibrator 做比例法深度推算:
-  校准: 用户一臂长位置按 C, 记录参考掌尺寸
-  实时: palm_size_ratio = ref / current → estimate_distance
-  映射: x,y 根据距离做透视缩放, z = 估算深度
-
-场景:
-  - 桌面 + 方向光 + 阴影
-  - 水杯 (可抓取)
-  - 虚拟手 (5指跟随, 深度校准后的精确位置)
-  - 按 C 校准 | 按 ESC 退出
+手部: 21关节 + 20骨骼 (椭球体, 肤色渐变, 指甲)
+场景: 墙壁 + 桌面 + 地毯 + 水杯 + 盆栽
+交互: 比例法深度校准 + 全空间移动 + 抓取水杯
 """
 
 from hand_api import HandAPI, DepthCalibrator, FINGER_NAMES
 from ursina import *
-from ursina.shaders import lit_with_shadows_shader
+from ursina.shaders import lit_with_shadows_shader, unlit_shader
 import math
 
-
 # ─── 场景 ────────────────────────────────────────────────────
-app = Ursina(borderless=False, title='Smart Finger - Digital Twin (Depth Calibrated)')
-camera.position = (0, 0.6, -1.5)
-camera.rotation = (10, 0, 0)
+app = Ursina(borderless=False, title='Smart Finger - Digital Twin')
+camera.position = (0, 0.8, -1.8)
+camera.rotation = (8, 0, 0)
 
-DirectionalLight(shadow_map_resolution=(2048, 2048))
+# 灯光
+DirectionalLight(shadow_map_resolution=(2048, 2048), direction=(-1, -2, -1))
+Entity(type='ambient_light', color=color.hex('#444444'))
 
-ground = Entity(model='plane', scale=6,
-                color=color.hex('#D2B48C'), texture_scale=(3, 3),
-                shader=lit_with_shadows_shader)
-table = Entity(model='cube', scale=(2.0, 0.08, 1.5), position=(0, 0.9, 0),
-               color=color.hex('#8B4513'), shader=lit_with_shadows_shader)
+# 墙壁
+wall = Entity(model='quad', scale=(8, 4), position=(0, 2, -2.5),
+              color=color.hex('#F0EDE5'), texture='white_cube', texture_scale=(8, 4),
+              shader=unlit_shader, double_sided=True)
+
+# 地板
+floor = Entity(model='plane', scale=8, color=color.hex('#C4A882'),
+               texture_scale=(4, 4), shader=lit_with_shadows_shader)
+
+# 地毯
+rug = Entity(model='plane', scale=(2.5, 1.8), position=(0, 0.01, 0.3),
+             color=color.hex('#7B5B3A'), texture_scale=(1, 1),
+             shader=lit_with_shadows_shader)
+
+# 桌面 (圆角效果用两层)
+table_top = Entity(model='cube', scale=(2.2, 0.06, 1.6), position=(0, 0.9, 0),
+                   color=color.hex('#A0724A'), shader=lit_with_shadows_shader)
+table_edge = Entity(model='cube', scale=(2.0, 0.08, 1.4), position=(0, 0.86, 0),
+                    color=color.hex('#8B5E3C'), shader=lit_with_shadows_shader)
+# 桌腿
+for x, z in [(-1.0, -0.7), (-1.0, 0.7), (1.0, -0.7), (1.0, 0.7)]:
+    Entity(model='cube', scale=(0.06, 0.86, 0.06), position=(x, 0.43, z),
+           color=color.hex('#6B4226'), shader=lit_with_shadows_shader)
+
+# 小盆栽
+pot_base = Entity(model='cube', scale=(0.10, 0.08, 0.10), position=(0.7, 0.95, 0.5),
+                  color=color.hex('#D2691E'), shader=lit_with_shadows_shader)
+pot_base2 = Entity(model='cube', scale=(0.12, 0.04, 0.12), position=(0.7, 0.90, 0.5),
+                   color=color.hex('#B85C1A'), shader=lit_with_shadows_shader)
+pot_plant = Entity(model='sphere', scale=(0.10, 0.08, 0.10), position=(0.7, 1.05, 0.5),
+                   color=color.hex('#228B22'), shader=lit_with_shadows_shader)
+
+# ─── 关节连接对 ──────────────────────────────────────────────
+BONES = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    (5, 9), (9, 13), (13, 17),
+]
+
+# 手指各段粗细 (起点→终点 半径)
+SKIN = '#F0C8A0'
+
+
+# ─── 虚拟手 (Metaball风格重叠球体) ──────────────────────────
+class HandModel(Entity):
+    """使用重叠球体模拟真实手部形状"""
+
+    def __init__(self):
+        super().__init__()
+        # 手掌主体
+        self.palm = Entity(parent=self, model='sphere',
+                           scale=(0.065, 0.022, 0.050),
+                           color=color.hex('#F0C8A0'),
+                           shader=lit_with_shadows_shader)
+        # 拇指肌肉球
+        self.thumb_pad = Entity(parent=self, model='sphere',
+                                scale=(0.025, 0.020, 0.020),
+                                color=color.hex('#F0C8A0'),
+                                shader=lit_with_shadows_shader)
+
+        # 21个关节球体 (不同大小模拟手指粗细)
+        joint_radius = {
+            0: 0.020,   # 手腕
+            1: 0.016, 2: 0.014, 3: 0.012, 4: 0.010,  # 拇指
+            5: 0.018, 6: 0.014, 7: 0.012, 8: 0.010,  # 食指
+            9: 0.020, 10: 0.015, 11: 0.013, 12: 0.010,  # 中指
+            13: 0.018, 14: 0.014, 15: 0.012, 16: 0.009,  # 无名
+            17: 0.015, 18: 0.012, 19: 0.010, 20: 0.008,  # 小指
+        }
+        self.joints = {}
+        for i in range(21):
+            r = joint_radius.get(i, 0.010)
+            col = '#E8C0A0' if i in (4, 8, 12, 16, 20) else '#F0C8A0'
+            j = Entity(parent=self, model='sphere', scale=r * 2,
+                       color=color.hex(col), shader=lit_with_shadows_shader)
+            self.joints[i] = j
+
+        # 手指中间加球体使手指更饱满
+        self.extra_joints = {}
+        extra_segments = [
+            (1.5, 0.013), (2.5, 0.012),   # 拇指
+            (5.5, 0.014), (6.5, 0.012),   # 食指
+            (9.5, 0.015), (10.5, 0.013),  # 中指
+            (13.5, 0.014), (14.5, 0.012), # 无名
+            (17.5, 0.011), (18.5, 0.010), # 小指
+        ]
+        for idx_float, r in extra_segments:
+            e = Entity(parent=self, model='sphere', scale=r * 2,
+                       color=color.hex('#F0C8A0'), shader=lit_with_shadows_shader)
+            self.extra_joints[idx_float] = e
+
+        # 指甲
+        self.nails = {}
+        for ti in [8, 12, 16]:
+            n = Entity(parent=self, model='quad', scale=(0.006, 0.005),
+                       color=color.hex('#FFE8D0'), shader=unlit_shader,
+                       billboard=True, double_sided=True)
+            self.nails[ti] = n
+
+        self.prev_pts = None
+
+    def update_from_landmarks(self, pts):
+        if not pts or len(pts) < 21:
+            return
+        if self.prev_pts is not None:
+            sm = 0.3
+            pts = [p * sm + q * (1 - sm) for p, q in zip(self.prev_pts, pts)]
+        self.prev_pts = pts[:]
+
+        wrist = pts[0]
+        self.position = wrist
+        rel = [p - wrist for p in pts]
+
+        # 手掌位于指根中心
+        roots = [rel[i] for i in [5, 9, 13, 17]]
+        c = Vec3(0, 0, 0)
+        for r in roots:
+            c += r
+        self.palm.position = c / 4
+        # 拇指肌肉在拇指根部
+        self.thumb_pad.position = rel[1] * 0.6 + rel[2] * 0.4
+
+        # 关节球体
+        for i, j in self.joints.items():
+            if i < len(rel):
+                j.position = rel[i]
+
+        # 中间填充球体 (线性插值)
+        for key, e in self.extra_joints.items():
+            a = int(key)
+            b = a + 1
+            t = key - a
+            if a < len(rel) and b < len(rel):
+                e.position = rel[a] * (1 - t) + rel[b] * t
+
+        # 指甲
+        for ti, n in self.nails.items():
+            if ti < len(rel):
+                n.position = rel[ti] + Vec3(0, 0.003, 0.001)
+
+
+# ─── 3D 坐标映射 ────────────────────────────────────────────
+def landmarks_to_3d(hand, calib):
+    lms = hand.landmarks_raw
+    if not lms or len(lms) < 21:
+        return None
+    wrist = lms[0]
+    d = calib.estimate_distance(hand.palm_size)
+    s = d * 2 * math.tan(math.radians(30))
+    wx, wy, wz = calib.map_to_3d(wrist.x, wrist.y, hand.palm_size)
+    base = Vec3(wx, wy + 0.3, -wz + 1.0)
+    scale = d * 0.5
+    pts = []
+    for lm in lms:
+        dx = (lm.x - wrist.x) * scale
+        dy = -(lm.y - wrist.y) * scale
+        dz = (lm.z - wrist.z) * 0.22 * scale
+        pts.append(base + Vec3(dx, dy, dz))
+    return pts
+
+
+# ─── 可交互物体基类 ──────────────────────────────────────────
+class Grabbable:
+    """可抓取物体的基类 mixin"""
+
+    def init_grab(self, root_pos):
+        self._grabbed = False
+        self._offset = Vec3(0, 0, 0)
+        self._root_pos = root_pos
+        self._parts = []
+
+    def try_grab(self, hand_pos, hand_label="Right"):
+        if (hand_pos - self._root_pos).length() < 0.6:
+            self._grabbed = True
+            self._offset = self._root_pos - hand_pos
+            self._grabber = hand_label
+            return True
+        return False
+
+    def try_release(self):
+        if not self._grabbed:
+            return False
+        self._grabbed = False
+        target_y = 0.92
+        for e in self._parts:
+            e.animate_position(
+                Vec3(e.x, e.y - self._root_pos.y + target_y, e.z),
+                duration=0.25,
+            )
+        return True
+
+    def update_grab(self):
+        if not self._grabbed:
+            return
+        hand_pos = hand_positions.get(self._grabber, Vec3(0, 0, 0))
+        target = self._offset + hand_pos
+        dt = time.dt * 18
+        for e in self._parts:
+            e.position = lerp(e.position, target + (e.position - self._root_pos), dt)
+
+    @property
+    def grabbed(self):
+        return self._grabbed
+
+    @property
+    def root_pos(self):
+        return self._root_pos
 
 
 # ─── 水杯 ────────────────────────────────────────────────────
-class Cup(Entity):
-    def __init__(self):
-        super().__init__(model='cube', scale=(0.25, 0.35, 0.25),
-                         position=(0, 1.2, 0), color=color.hex('#4FC3F7'),
-                         shader=lit_with_shadows_shader)
-        Entity(parent=self, model='cube', scale=(0.27, 0.03, 0.27),
-               position=(0, -0.19, 0), color=color.hex('#2E7D32'),
-               shader=lit_with_shadows_shader)
-        self.water = Entity(parent=self, model='cube', scale=(0.22, 0.04, 0.22),
-                            position=(0, 0.08, 0), color=color.hex('#81D4FA'),
+class Cup(Entity, Grabbable):
+    def __init__(self, pos=(0, 1.15, 0)):
+        super().__init__()
+        col = color.hex('#4FC3F7')
+        self.body = Entity(model='sphere', scale=(0.14, 0.18, 0.14),
+                           position=pos, color=col, shader=lit_with_shadows_shader)
+        self.body2 = Entity(model='sphere', scale=(0.14, 0.18, 0.14),
+                            position=Vec3(pos) + Vec3(0, 0.30, 0),
+                            color=col, shader=lit_with_shadows_shader)
+        self.bottom = Entity(model='sphere', scale=(0.12, 0.02, 0.12),
+                             position=Vec3(pos) - Vec3(0, 0.19, 0),
+                             color=color.hex('#2E7D32'), shader=lit_with_shadows_shader)
+        self.water = Entity(model='sphere', scale=(0.11, 0.02, 0.11),
+                            position=Vec3(pos), color=color.hex('#81D4FA'),
                             shader=lit_with_shadows_shader)
-        self.grabbed = False
-        self.grab_offset = Vec3(0, 0, 0)
-
-    def grab(self, hand_pos):
-        self.grabbed = True
-        self.grab_offset = self.position - hand_pos
-
-    def release(self):
-        self.grabbed = False
-        self.animate_position(Vec3(self.x, 0.92, self.z), duration=0.3)
+        self.handle = Entity(model='cube', scale=(0.02, 0.12, 0.02),
+                             position=Vec3(pos) + Vec3(0.16, 0.15, 0),
+                             color=col, shader=lit_with_shadows_shader)
+        self._parts = [self.body, self.body2, self.bottom, self.water, self.handle]
+        self.init_grab(Vec3(pos))
 
     def update(self):
-        global hand_position
-        if self.grabbed:
-            target = self.grab_offset + hand_position
-            self.position = lerp(self.position, target, time.dt * 18)
-            self.water.rotation_z = math.sin(time.time() * 5) * 2
+        if self._grabbed:
+            self.update_grab()
+            self.water.rotation_z = math.sin(time.time() * 5) * 3
 
 
-cup = Cup()
-
-
-# ─── 虚拟手 ──────────────────────────────────────────────────
-class VirtualFinger(Entity):
-    def __init__(self, name, col, parent):
-        super().__init__(parent=parent, model='cube',
-                         scale=(0.035, 0.10, 0.035),
-                         color=color.hex(col), shader=lit_with_shadows_shader)
-        self.tip = Entity(parent=self, model='sphere',
-                          scale=0.045, position=(0, 0.07, 0),
-                          color=color.hex(col))
-
-    def set_curl(self, curl_factor, extended):
-        self.rotation = (curl_factor * 90, 0, 0)
-        v = 0.4 + 0.6 * (1 - curl_factor)
-        self.tip.color = Color(0.2, v, 0.2, 1)
-
-
-class VirtualHand(Entity):
-    def __init__(self):
+# ─── 球 ──────────────────────────────────────────────────────
+class Ball(Entity, Grabbable):
+    def __init__(self, pos=(0.5, 1.0, 0.3)):
         super().__init__()
-        Entity(parent=self, model='cube', scale=(0.10, 0.035, 0.08),
-               color=color.hex('#FFDAB9'), shader=lit_with_shadows_shader)
-        configs = [
-            ("Thumb", '#E8B88A', Vec3(-0.06, 0.025, 0)),
-            ("Index", '#FFDAB9', Vec3(-0.025, 0.025, -0.035)),
-            ("Middle", '#FFDAB9', Vec3(0, 0.025, -0.04)),
-            ("Ring", '#FFDAB9', Vec3(0.025, 0.025, -0.035)),
-            ("Pinky", '#FFDAB9', Vec3(0.05, 0.025, -0.015)),
-        ]
-        self.fingers = []
-        for name, col, pos in configs:
-            f = VirtualFinger(name, col, self)
-            f.position = pos
-            self.fingers.append(f)
+        self.body = Entity(model='sphere', scale=0.10, position=pos,
+                           color=color.hex('#FF5252'), shader=lit_with_shadows_shader)
+        self.stripe = Entity(model='cube', scale=(0.08, 0.01, 0.01),
+                             position=Vec3(pos) + Vec3(0, 0, 0.06),
+                             color=color.hex('#FFFFFF'), shader=lit_with_shadows_shader)
+        self._parts = [self.body, self.stripe]
+        self.init_grab(Vec3(pos))
 
-    def update_from_hand(self, hand, dt, calib: DepthCalibrator):
-        if not hand or not hand.detected:
-            self.visible = False
-            return
-        self.visible = True
+    def update(self):
+        if self._grabbed:
+            self.update_grab()
 
-        # 比例法深度映射 (校准后更精确)
-        x, y, z = calib.map_to_3d(hand.palm_x, hand.palm_y, hand.palm_size)
-        pos = Vec3(x, y + 0.3, -z + 1.0)
-        self.position = lerp(self.position, pos, dt * 12)
-        self.y = max(self.y, 0.2)
 
-        for i, fs in enumerate(hand.fingers):
-            if i < len(self.fingers):
-                curl = max(0, min(1, fs.curl_deg / 120))
-                self.fingers[i].set_curl(curl, fs.extended)
+# ─── 方块 ──────────────────────────────────────────────────────
+class Block(Entity, Grabbable):
+    def __init__(self, pos=(-0.5, 1.0, -0.2)):
+        super().__init__()
+        self.body = Entity(model='cube', scale=(0.12, 0.12, 0.12), position=pos,
+                           color=color.hex('#FFC107'), shader=lit_with_shadows_shader)
+        self._parts = [self.body]
+        self.init_grab(Vec3(pos))
+
+    def update(self):
+        if self._grabbed:
+            self.update_grab()
+
+
+# ─── 手机 ────────────────────────────────────────────────────
+class Phone(Entity, Grabbable):
+    def __init__(self, pos=(0, 1.0, 0.6)):
+        super().__init__()
+        self.body = Entity(model='cube', scale=(0.06, 0.12, 0.005), position=pos,
+                           color=color.hex('#1A1A1A'), shader=lit_with_shadows_shader)
+        self.screen = Entity(model='quad', scale=(0.05, 0.10), position=Vec3(pos) + Vec3(0, 0, 0.004),
+                             color=color.hex('#2196F3'), shader=unlit_shader, double_sided=True)
+        self._parts = [self.body, self.screen]
+        self.init_grab(Vec3(pos))
+
+    def update(self):
+        if self._grabbed:
+            self.update_grab()
+
+
+# ─── 创建所有物体 ────────────────────────────────────────────
+objects = [
+    Cup(pos=(0, 1.15, 0)),
+    Ball(pos=(0.5, 1.0, 0.3)),
+    Block(pos=(-0.5, 1.0, -0.2)),
+    Phone(pos=(0, 1.0, 0.6)),
+]
 
 
 # ─── 初始化 ──────────────────────────────────────────────────
-hand_api = HandAPI(max_hands=1)
+hand_api = HandAPI(max_hands=2)
 hand_api.start()
 calib = DepthCalibrator(ref_distance=0.45)
 
-virtual_hand = VirtualHand()
-hand_position = Vec3(0, 0, 0)
-grabbed_prev = False
+hand_left = HandModel()
+hand_right = HandModel()
+hand_left.color_shift = -0.02
+hand_right.color_shift = 0.0
 
-Text(text='Smart Finger - Digital Twin (Depth Calibrated)',
-     position=(-0.85, 0.48), scale=1.2, color=color.white)
-status = Text(text='Waiting for hand...', position=(-0.85, 0.44),
-              scale=0.8, color=color.yellow)
-calib_text = Text(text='Press C to calibrate depth',
-                  position=(-0.85, 0.40), scale=0.6, color=color.gray)
+hand_positions = {"Left": Vec3(0, 0, 0), "Right": Vec3(0, 0, 0)}
+grabbed_prev = {"Left": False, "Right": False}
+
+Text(text='Smart Finger - Dual Hands', position=(-0.85, 0.48), scale=1.2, color=color.white)
+status = Text(text='Waiting...', position=(-0.85, 0.44), scale=0.8, color=color.yellow)
+hint = Text(text='[C] Calibrate  [Q] Quit', position=(-0.85, 0.40), scale=0.6, color=color.gray)
 
 
-# ─── 更新循环 ────────────────────────────────────────────────
 def update():
-    global hand_position, grabbed_prev
+    hands = hand_api.get_hand_data()
+    active = [h for h in hands if h.detected and h.landmarks_raw]
 
-    hand = hand_api.get_primary_hand()
-    if not hand or not hand.detected:
-        status.text = 'No hand'
-        virtual_hand.visible = False
-        calib_text.text = 'Press C to calibrate depth'
+    if not active:
+        status.text = 'No hands'
+        hand_left.visible = False
+        hand_right.visible = False
         return
 
-    virtual_hand.update_from_hand(hand, time.dt, calib)
-    hand_position = virtual_hand.position
+    hand_left.visible = False
+    hand_right.visible = False
 
-    dist = calib.estimate_distance(hand.palm_size)
-    status.text = (
-        f'{hand.label}  |  '
-        f'Grip:{hand.grab_strength:.2f}  |  '
-        f'Depth:{dist:.2f}m  |  '
-        f'Palm:{hand.palm_size:.3f}'
-    )
+    for h in active:
+        hand_model = hand_left if h.label == "Left" else hand_right
+        hand_model.visible = True
+        pts = landmarks_to_3d(h, calib)
+        if pts is None:
+            continue
+        hand_model.update_from_landmarks(pts)
+        hand_positions[h.label] = pts[0]
 
-    ref_txt = f" (ref={calib.ref_palm_size:.3f})" if calib.calibrated else ""
-    calib_text.text = f'Calibrated:{calib.calibrated}{ref_txt}  [C]校准'
+        d = calib.estimate_distance(h.palm_size)
+        status.text = f'{h.label}  Grip:{h.grab_strength:.2f}  Depth:{d:.2f}m'
 
-    is_grabbed = hand.grab_strength > 0.55
-    if is_grabbed and not grabbed_prev:
-        if (virtual_hand.position - cup.position).length() < 0.5:
-            cup.grab(virtual_hand.position)
-    elif not is_grabbed and grabbed_prev and cup.grabbed:
-        cup.release()
-    grabbed_prev = is_grabbed
+        is_grab = h.grab_strength > 0.55
+        hand_pos = pts[0]
+        if is_grab and not grabbed_prev[h.label]:
+            for obj in objects:
+                if not obj.grabbed and obj.try_grab(hand_pos, h.label):
+                    print(f"[Grab] {obj.__class__.__name__} by {h.label}")
+                    break
+        elif not is_grab and grabbed_prev[h.label]:
+            for obj in objects:
+                if obj.grabbed:
+                    obj.try_release()
+                    print(f"[Release] {obj.__class__.__name__}")
+        grabbed_prev[h.label] = is_grab
 
 
 def input(key):
     if key == 'c':
-        hand = hand_api.get_primary_hand()
-        if hand and hand.detected and hand.palm_size > 0.01:
-            calib.calibrate(hand.palm_size)
-            print(f"[Calib] ref_palm_size={calib.ref_palm_size:.4f} at {calib.ref_distance}m")
+        for h in hand_api.get_hand_data():
+            if h.detected and h.palm_size > 0.01:
+                calib.calibrate(h.palm_size)
+                break
+    elif key == 'q':
+        app.quit()
 
 
-# ─── 启动 ────────────────────────────────────────────────────
 if __name__ == '__main__':
     try:
         app.run()
