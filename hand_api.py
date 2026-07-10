@@ -55,10 +55,51 @@ class HandState:
     palm_x: float = 0.0        # 掌心 = 中指MCP
     palm_y: float = 0.0
     palm_z: float = 0.0
+    palm_size: float = 0.0     # 归一化手掌尺寸 (wrist→mid_mcp 距离)
     fingers: list = field(default_factory=lambda: [FingerState(i, FINGER_NAMES[i]) for i in range(5)])
     grab_strength: float = 0.0   # 0=张开, 1=紧握
     pointing_down: bool = False
     landmarks_raw: list = field(default_factory=list)
+
+
+class DepthCalibrator:
+    """深度校准器 — 基于掌心尺寸比例推算真实深度
+
+    原理: 手掌在画面中的大小与到摄像头的距离成反比 (小孔成像模型)
+    calibration: 用户将手放在已知距离(约一臂长), 记录参考掌尺寸
+    """
+
+    def __init__(self, ref_distance=0.5):
+        self.ref_distance = ref_distance       # 参考距离 (米)
+        self.ref_palm_size = None              # 参考掌尺寸 (归一化坐标)
+        self.calibrated = False
+
+    def calibrate(self, palm_size):
+        self.ref_palm_size = palm_size
+        self.calibrated = True
+        return self.ref_palm_size
+
+    def estimate_distance(self, palm_size):
+        """根据当前手掌大小估算到摄像头的距离 (米)"""
+        if not self.calibrated or palm_size < 0.001:
+            return self.ref_distance
+        return self.ref_distance * (self.ref_palm_size / palm_size)
+
+    def map_to_3d(self, hx, hy, palm_size, fov_h=60):
+        """将归一化坐标 (0~1) 映射到 3D 世界坐标 (米)
+
+        使用小孔成像模型:
+          x_world = (x_norm - 0.5) * distance * 2 * tan(fov_h/2) * (w/h)
+          y_world = -(y_norm - 0.5) * distance * 2 * tan(fov_h/2)
+          z_world = distance
+        """
+        d = self.estimate_distance(palm_size)
+        scale = d * 2 * math.tan(math.radians(fov_h / 2))
+        aspect = 640 / 480  # 假设摄像头宽高比
+        x = (hx - 0.5) * scale * aspect
+        y = -(hy - 0.5) * scale
+        z = d
+        return x, y, z
 
 
 class HandAPI:
@@ -198,6 +239,7 @@ class HandAPI:
                     h.label = hd[0].category_name if hd else "?"
                     h.wrist_x, h.wrist_y, h.wrist_z = lms[0].x, lms[0].y, lms[0].z
                     h.palm_x, h.palm_y, h.palm_z = lms[9].x, lms[9].y, lms[9].z
+                    h.palm_size = math.hypot(lms[9].x - lms[0].x, lms[9].y - lms[0].y)
                     h.fingers = [self._compute_finger_state(lms, fi) for fi in range(5)]
                     h.grab_strength = self._compute_grab_strength(lms)
                     h.pointing_down = lms[9].y > lms[0].y and all(lms[i].y > lms[9].y for i in [8, 12, 16])
