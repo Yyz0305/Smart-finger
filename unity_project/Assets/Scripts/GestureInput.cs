@@ -1,72 +1,67 @@
-using System.Collections.Generic;
 using UnityEngine;
+using System.Collections.Generic;
 
-/// <summary>
-/// 手势输入 — 根据手部数据触发抓取/释放
-/// 挂载到场景中, 监听 HandDataReceiver 事件
-/// </summary>
 public class GestureInput : MonoBehaviour
 {
-    [Header("场景物体")]
-    public List<GrabbableObject> grabbableObjects;
-
     private HandDataReceiver _receiver;
-    private Dictionary<string, bool> _prevGrab = new();
+    private readonly Dictionary<string, bool> _prevGrab = new();
+    private readonly List<GrabbableObject> _objects = new();
 
     void Start()
     {
         _receiver = FindObjectOfType<HandDataReceiver>();
-        if (_receiver != null)
-        {
-            _receiver.OnRightHandUpdate += OnHandUpdate;
-            _receiver.OnLeftHandUpdate += OnHandUpdate;
-        }
     }
 
-    void OnHandUpdate(HandData data)
+    void Update()
     {
-        if (data == null) return;
+        // Find grabbable objects in scene
+        _objects.Clear();
+        _objects.AddRange(FindObjectsOfType<GrabbableObject>());
 
-        string key = data.label;
-        bool nowGrab = data.grab_strength > 0.55f;
-        bool prevGrab = _prevGrab.ContainsKey(key) && _prevGrab[key];
-
-        // 找到对应手的根 Transform
-        Transform handRoot = FindHandRoot(data.label);
-        if (handRoot == null) return;
-
-        if (nowGrab && !prevGrab)
+        // Find hand controllers
+        var hands = FindObjectsOfType<HandController>();
+        foreach (var hand in hands)
         {
-            // 尝试抓取最近的物体
-            foreach (var obj in grabbableObjects)
+            string key = hand.name;
+            bool nowGrab = false;
+            // Get grab state from most recent hand data via receiver
+            // For simplicity, we check distance-based grab each frame
+
+            bool prevGrab = _prevGrab.ContainsKey(key) && _prevGrab[key];
+
+            // Check if any finger tips are close to objects (grab attempt)
+            float closestDist = float.MaxValue;
+            GrabbableObject closestObj = null;
+
+            foreach (var obj in _objects)
             {
-                if (!obj.IsGrabbed && obj.TryGrab(handRoot))
+                if (obj.IsGrabbed) continue;
+                float dist = Vector3.Distance(hand.transform.position, obj.transform.position);
+                if (dist < obj.grabDistance && dist < closestDist)
                 {
-                    Debug.Log($"[Grab] {obj.name} by {data.label}");
-                    break;
+                    closestDist = dist;
+                    closestObj = obj;
                 }
             }
-        }
-        else if (!nowGrab && prevGrab)
-        {
-            // 释放所有被这只手抓住的物体
-            foreach (var obj in grabbableObjects)
+
+            // Simulate grab: if hand is close to object, grab it
+            nowGrab = closestObj != null;
+
+            if (nowGrab && !prevGrab && closestObj != null)
             {
-                if (obj.IsGrabbed) obj.Release();
+                closestObj.TryGrab(hand.transform);
+                Debug.Log($"[Grab] {closestObj.name} by {key}");
             }
-        }
+            else if (!nowGrab && prevGrab)
+            {
+                // Release all grabbed by this hand
+                foreach (var obj in _objects)
+                {
+                    if (obj.IsGrabbed) obj.Release();
+                }
+            }
 
-        _prevGrab[key] = nowGrab;
-    }
-
-    Transform FindHandRoot(string label)
-    {
-        var hands = FindObjectsOfType<HandController>();
-        foreach (var h in hands)
-        {
-            // 通过手部位置区分 (简单实现)
-            return h.transform;
+            _prevGrab[key] = nowGrab;
         }
-        return null;
     }
 }

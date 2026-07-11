@@ -1,30 +1,27 @@
-using System;
 using System.Collections.Generic;
+using Newtonsoft.Json;
 using UnityEngine;
 
-[Serializable]
+[System.Serializable]
 public class HandData
 {
     public string label;
-    public float[] wrist;
-    public float[] palm;
     public float palm_size;
     public float grab_strength;
     public bool pointing_down;
-    public float[][] landmarks;   // 21 x [x, y, z]
-    public FingerData[] fingers;
+    public List<List<float>> landmarks;
+    public List<FingerData> fingers;
 }
 
-[Serializable]
+[System.Serializable]
 public class FingerData
 {
     public bool extended;
     public float angle_deg;
     public float curl_deg;
-    public float[] tip;
 }
 
-[Serializable]
+[System.Serializable]
 public class HandsMessage
 {
     public List<HandData> hands;

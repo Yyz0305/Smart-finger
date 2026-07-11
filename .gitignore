@@ -8,3 +8,9 @@ gesture_models/
 venv/
 .vscode/
 *.task
+unity_project/Library/
+unity_project/Temp/
+unity_project/Logs/
+unity_project/UserSettings/
+*.sln
+*.csproj
